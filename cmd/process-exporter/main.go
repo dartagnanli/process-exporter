@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fsnotify/fsnotify"
 	"github.com/ncabatoff/fakescraper"
 	common "github.com/ncabatoff/process-exporter"
 	"github.com/ncabatoff/process-exporter/collector"
@@ -29,14 +30,14 @@ func printManual() {
 	fmt.Print(`Usage:
   process-exporter [options] -config.path filename.yml
 
-or 
+or
 
   process-exporter [options] -procnames name1,...,nameN [-namemapping k1,v1,...,kN,vN]
 
 The recommended option is to use a config file, but for convenience and
 backwards compatibility the -procnames/-namemapping options exist as an
 alternative.
- 
+
 The -children option (default:true) makes it so that any process that otherwise
 isn't part of its own group becomes part of the first group found (if any) when
 walking the process tree upwards.  In other words, resource usage of
@@ -46,14 +47,14 @@ as a different group name.
 Command-line process selection (procnames/namemapping):
 
   Every process not in the procnames list is ignored.  Otherwise, all processes
-  found are reported on as a group based on the process name they share. 
+  found are reported on as a group based on the process name they share.
   Here 'process name' refers to the value found in the second field of
   /proc/<pid>/stat, which is truncated at 15 chars.
 
   The -namemapping option allows assigning a group name based on a combination of
-  the process name and command line.  For example, using 
+  the process name and command line.  For example, using
 
-    -namemapping "python2,([^/]+)\.py,java,-jar\s+([^/]+).jar" 
+    -namemapping "python2,([^/]+)\.py,java,-jar\s+([^/]+).jar"
 
   will make it so that each different python2 and java -jar invocation will be
   tracked with distinct metrics.  Processes whose remapped name is absent from
@@ -176,6 +177,8 @@ func main() {
 			"log debugging information to stdout")
 		showVersion = flag.Bool("version", false,
 			"print version information and exit")
+		autoReload = flag.Bool("config.auto-reload", false,
+			"auto reload when config file changed")
 	)
 	flag.Parse()
 
@@ -192,61 +195,69 @@ func main() {
 		return
 	}
 
-	var matchnamer common.MatchNamer
+	var pc *collector.NamedProcessCollector
 
-	if *configPath != "" {
-		if *nameMapping != "" || *procNames != "" {
-			log.Fatalf("-config.path cannot be used with -namemapping or -procnames")
-		}
+	RegisterController := func() {
+		var matchnamer common.MatchNamer
 
-		cfg, err := config.ReadFile(*configPath, *debug)
-		if err != nil {
-			log.Fatalf("error reading config file %q: %v", *configPath, err)
-		}
-		log.Printf("Reading metrics from %s based on %q", *procfsPath, *configPath)
-		matchnamer = cfg.MatchNamers
-		if *debug {
-			log.Printf("using config matchnamer: %v", cfg.MatchNamers)
-		}
-	} else {
-		namemapper, err := parseNameMapper(*nameMapping)
-		if err != nil {
-			log.Fatalf("Error parsing -namemapping argument '%s': %v", *nameMapping, err)
-		}
+		if *configPath != "" {
+			if *nameMapping != "" || *procNames != "" {
+				log.Fatalf("-config.path cannot be used with -namemapping or -procnames")
+			}
 
-		var names []string
-		for _, s := range strings.Split(*procNames, ",") {
-			if s != "" {
-				if _, ok := namemapper.mapping[s]; !ok {
-					namemapper.mapping[s] = nil
+			cfg, err := config.ReadFile(*configPath, *debug)
+			if err != nil {
+				log.Printf("error reading config file %q: %v", *configPath, err)
+				return
+			}
+			log.Printf("Reading metrics from %s based on %q", *procfsPath, *configPath)
+			matchnamer = cfg.MatchNamers
+			if *debug {
+				log.Printf("using config matchnamer: %v", cfg.MatchNamers)
+			}
+		} else {
+			namemapper, err := parseNameMapper(*nameMapping)
+			if err != nil {
+				log.Fatalf("Error parsing -namemapping argument '%s': %v", *nameMapping, err)
+			}
+
+			var names []string
+			for _, s := range strings.Split(*procNames, ",") {
+				if s != "" {
+					if _, ok := namemapper.mapping[s]; !ok {
+						namemapper.mapping[s] = nil
+					}
+					names = append(names, s)
 				}
-				names = append(names, s)
+
+				log.Printf("Reading metrics from %s for procnames: %v", *procfsPath, names)
+				if *debug {
+					log.Printf("using cmdline matchnamer: %v", namemapper)
+				}
+				matchnamer = namemapper
 			}
 		}
 
-		log.Printf("Reading metrics from %s for procnames: %v", *procfsPath, names)
-		if *debug {
-			log.Printf("using cmdline matchnamer: %v", namemapper)
+		var err error
+		pc, err = collector.NewProcessCollector(
+			collector.ProcessCollectorOption{
+				ProcFSPath:  *procfsPath,
+				Children:    *children,
+				Threads:     *threads,
+				GatherSMaps: *smaps,
+				Namer:       matchnamer,
+				Recheck:     *recheck,
+				Debug:       *debug,
+			},
+		)
+		if err != nil {
+			log.Fatalf("Error initializing: %v", err)
 		}
-		matchnamer = namemapper
+
+		prometheus.MustRegister(pc)
 	}
 
-	pc, err := collector.NewProcessCollector(
-		collector.ProcessCollectorOption{
-			ProcFSPath:  *procfsPath,
-			Children:    *children,
-			Threads:     *threads,
-			GatherSMaps: *smaps,
-			Namer:       matchnamer,
-			Recheck:     *recheck,
-			Debug:       *debug,
-		},
-	)
-	if err != nil {
-		log.Fatalf("Error initializing: %v", err)
-	}
-
-	prometheus.MustRegister(pc)
+	RegisterController()
 
 	if *onceToStdoutDelay != 0 {
 		// We throw away the first result because that first collection primes the pump, and
@@ -259,6 +270,55 @@ func main() {
 		return
 	}
 
+	if *autoReload {
+		watcher, err := fsnotify.NewWatcher()
+		if err != nil {
+			log.Fatalf("Start watcher failed, %v", err)
+		}
+		defer watcher.Close()
+
+		err = watcher.Add(*configPath)
+		if err != nil {
+			log.Fatalf("Add watcher for %s failed, %v", *configPath, err)
+		}
+
+		log.Printf("Starting file system watcher for %s", *configPath)
+
+		go func() {
+			for {
+				select {
+				case e := <-watcher.Events:
+					if e.Has(fsnotify.Write) || e.Has(fsnotify.Remove) || e.Has(fsnotify.Rename) {
+						err = watcher.Remove(*configPath)
+						if err != nil {
+							log.Fatalf("Remove old watcher for %s failed, %v", *configPath, err)
+						}
+
+						for {
+							if stat, err := os.Stat(*configPath); (err != nil && !os.IsExist(err)) || stat.Size() == 0 {
+								log.Printf("Config file removed or renamed, waiting")
+								time.Sleep(5 * time.Second)
+							} else {
+								log.Printf("Config file changed, reloading")
+
+								err = watcher.Add(*configPath)
+								if err != nil {
+									log.Fatalf("Add watcher for %s failed, %v", *configPath, err)
+								}
+
+								prometheus.Unregister(pc)
+								RegisterController()
+
+								break
+							}
+						}
+					}
+				case err := <-watcher.Errors:
+					log.Printf("Config watcher failed, %v", err)
+				}
+			}
+		}()
+	}
 	http.Handle(*metricsPath, promhttp.Handler())
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -270,8 +330,14 @@ func main() {
 			</body>
 			</html>`))
 	})
-	server := &http.Server{Addr: *listenAddress}
-	if err := web.ListenAndServe(server, *tlsConfigFile, logger); err != nil {
+	server := &http.Server{}
+	listenAddresses := []string{*listenAddress}
+	flagConfig := web.FlagConfig{
+		WebListenAddresses: &listenAddresses,
+		WebSystemdSocket:   nil,
+		WebConfigFile:      tlsConfigFile,
+	}
+	if err := web.ListenAndServe(server, &flagConfig, logger); err != nil {
 		log.Fatalf("Failed to start the server: %v", err)
 		os.Exit(1)
 	}
