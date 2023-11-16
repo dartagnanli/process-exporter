@@ -78,3 +78,13 @@ update-go-deps:
 	go mod tidy
 
 .PHONY: all style format test vet build integ docker
+
+ROOT := gitlab.inner.galaxy.ksyun.com/luban/process_exporter
+TARGETS := process_exporter
+CMD_DIR := ./
+OUTPUT_DIR := ./.bin/
+VERSION := $(shell git rev-parse --short HEAD)
+
+build:
+	CGO_ENABLED=0 GO111MODULE=auto go build -o ${OUTPUT_DIR}/${TARGETS}_amd64
+	CGO_ENABLED=0 GO111MODULE=auto GOOS=linux GOARCH=arm64 go build -o ${OUTPUT_DIR}/${TARGETS}_arm64
