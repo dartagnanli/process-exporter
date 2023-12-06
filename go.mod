@@ -1,6 +1,6 @@
 module github.com/ncabatoff/process-exporter
 
-go 1.21
+go 1.19
 
 require (
 	github.com/fsnotify/fsnotify v1.7.0

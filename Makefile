@@ -37,9 +37,11 @@ vet:
 	@echo ">> vetting code"
 	go vet $(pkgs)
 
+#编译二进制
 build:
 	@echo ">> building code"
-	cd cmd/process-exporter; CGO_ENABLED=0 go build -ldflags "$(VERSION_LDFLAGS)" -o ../../process-exporter -a -tags netgo
+	cd cmd/process-exporter; CGO_ENABLED=0 go build -ldflags "$(VERSION_LDFLAGS)" -o ../../.bin/process_exporter_amd64 -a -tags netgo
+	cd cmd/process-exporter; CGO_ENABLED=0 GOARCH=arm64 go build -ldflags "$(VERSION_LDFLAGS)" -o ../../.bin/process_exporter_arm64 -a -tags netgo
 
 smoke:
 	@echo ">> smoke testing process-exporter"
@@ -78,13 +80,3 @@ update-go-deps:
 	go mod tidy
 
 .PHONY: all style format test vet build integ docker
-
-ROOT := gitlab.inner.galaxy.ksyun.com/luban/process_exporter
-TARGETS := process_exporter
-CMD_DIR := ./
-OUTPUT_DIR := ./.bin/
-VERSION := $(shell git rev-parse --short HEAD)
-
-build:
-	CGO_ENABLED=0 GO111MODULE=auto go build -o ${OUTPUT_DIR}/${TARGETS}_amd64
-	CGO_ENABLED=0 GO111MODULE=auto GOOS=linux GOARCH=arm64 go build -o ${OUTPUT_DIR}/${TARGETS}_arm64
