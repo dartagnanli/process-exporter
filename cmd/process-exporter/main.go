@@ -289,10 +289,10 @@ func main() {
 				select {
 				case e := <-watcher.Events:
 					if e.Has(fsnotify.Write) || e.Has(fsnotify.Remove) || e.Has(fsnotify.Rename) {
-						err = watcher.Remove(*configPath)
-						if err != nil {
-							log.Fatalf("Remove old watcher for %s failed, %v", *configPath, err)
-						}
+						// err = watcher.Remove(*configPath)
+						// if err != nil {
+						// 	log.Fatalf("Remove old watcher for %s failed, %v", *configPath, err)
+						// }
 
 						for {
 							if stat, err := os.Stat(*configPath); (err != nil && !os.IsExist(err)) || stat.Size() == 0 {
